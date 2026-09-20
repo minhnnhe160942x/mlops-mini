@@ -32,3 +32,16 @@ def test_materialise_matches_the_drift_gate_expectation():
     reference, batch = data.materialise({"shift": 0.0, "batch_rows": 200})
     scores = drift.dataset_psi(reference, batch, data.feature_columns(reference))
     assert drift.summarise(scores, threshold=0.2)["drifted"] is False
+
+
+def test_clean_batch_alone_would_not_trigger_training():
+    """Cold start is the only reason an undrifted batch should train.
+
+    Guards the gate's first arm: without drift the PSI verdict must be False, so
+    anything that trains on a clean batch is coming from the cold-start check.
+    """
+    from mlops import drift
+
+    reference, batch = data.materialise({"shift": 0.0, "batch_rows": 200})
+    scores = drift.dataset_psi(reference, batch, data.feature_columns(reference))
+    assert drift.summarise(scores, threshold=0.2)["drifted"] is False

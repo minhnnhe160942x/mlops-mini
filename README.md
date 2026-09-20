@@ -27,6 +27,10 @@ The pipeline retrains only when the incoming batch actually looks different, and
 only when the new model beats the incumbent. Those two gates are the point of the project —
 without them this would be a cron job that overwrites production on every run.
 
+The drift gate has a second arm for cold start: with no champion registered, it trains
+regardless of drift. Otherwise a fresh install with clean data would skip training forever
+and the API would never have anything to serve.
+
 ## Services
 
 | Service | Port | Purpose |
@@ -44,32 +48,56 @@ if something already owns a default.
 
 ## Quick start
 
+One command, no configuration:
+
 ```bash
-cp .env.example .env
-docker compose up -d --build       # or: make up
+docker compose up -d --build
 ```
 
-Then:
+No `.env` is needed — every setting has a working default. Give it two or three minutes;
+the pipeline runs itself once on first start, so by the time the stack is up there is
+already a trained model registered and being served.
 
-1. Open Airflow at <http://localhost:8080> (login `admin` / `admin`).
-2. Trigger `training_pipeline` with a config that simulates drifted input:
+| What | Where | Credentials |
+|---|---|---|
+| Airflow UI | <http://localhost:8080> | `admin` / `admin` |
+| MLflow UI | <http://localhost:5000> | none |
+| Serving API | <http://localhost:8000/docs> | none |
 
-   ```bash
-   make trigger
-   # docker compose exec airflow-scheduler \
-   #   airflow dags trigger training_pipeline --conf '{"shift": 1.5, "batch_rows": 200}'
-   ```
+Check that it worked:
 
-3. Watch the run in Airflow and the experiment at <http://localhost:5000>.
-4. Point the API at the freshly promoted model and predict:
+```bash
+curl http://localhost:8000/model      # the version being served, with its metrics
+curl http://localhost:8000/readyz     # 200 once a model is loaded
+```
 
-   ```bash
-   curl -X POST http://localhost:8000/reload
-   curl http://localhost:8000/model
-   ```
+### Demonstrating both branches
 
-Trigger with `{"shift": 0.0}` instead and the drift gate routes to `skip_retrain` — the
-champion is left alone. That is the behaviour to demonstrate both ways.
+The pipeline retrains only when the data drifts. Trigger it either way:
+
+```bash
+# Drifted input -> retrains and promotes if it beats the champion
+make trigger
+
+# Clean input -> drift gate routes to skip_retrain, champion untouched
+docker compose exec airflow-scheduler \
+  airflow dags trigger training_pipeline --conf '{"shift": 0.0, "batch_rows": 200}'
+```
+
+Open the DAG's grid view in Airflow and the two runs sit side by side: where one took
+`train -> evaluate -> register_and_promote`, the other took `skip_retrain` and skipped the
+rest.
+
+After a promotion, point the API at the new version:
+
+```bash
+curl -X POST http://localhost:8000/reload
+```
+
+### Changing the defaults
+
+Copy `.env.example` to `.env` only if you want to override something — host ports, the admin
+password, or the drift threshold.
 
 ## API
 

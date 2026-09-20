@@ -39,7 +39,9 @@ def materialise(spec: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 @dag(
     dag_id="training_pipeline",
-    schedule=None,
+    # Runs itself once on first start so a fresh clone ends up with a served
+    # model without anyone having to trigger anything.
+    schedule="@once",
     start_date=datetime(2026, 1, 1, tzinfo=UTC),
     catchup=False,
     tags=["mlops", "mlflow"],
@@ -83,8 +85,25 @@ def training_pipeline():
 
     @task.branch
     def drift_gate(spec: dict) -> str:
-        """Retrain only when the batch actually looks different."""
-        return "train" if spec["drift"]["drifted"] else "skip_retrain"
+        """Retrain when the batch looks different - or when nothing is serving yet.
+
+        The cold-start arm matters: on a fresh install there is no champion, so
+        "no drift" would otherwise leave the registry empty and the API on 503
+        forever. A system with nothing to serve always needs a first model.
+        """
+        if spec["drift"]["drifted"]:
+            return "train"
+
+        client = registry.get_client(SETTINGS.tracking_uri)
+        incumbent = registry.champion_metric(
+            client, SETTINGS.model_name, SETTINGS.model_alias, PRIMARY_METRIC
+        )
+        if incumbent is None:
+            print("no champion registered yet - training a first model")
+            return "train"
+
+        print("no drift and a champion exists - keeping it")
+        return "skip_retrain"
 
     @task
     def skip_retrain() -> str:
