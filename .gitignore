@@ -10,3 +10,6 @@ mlruns/
 mlflow-data/
 *.db
 .DS_Store
+
+# Planning artifacts stay local.
+.planning/
