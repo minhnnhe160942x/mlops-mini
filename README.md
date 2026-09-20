@@ -34,6 +34,7 @@ without them this would be a cron job that overwrites production on every run.
 | `airflow-apiserver` | 8080 | Airflow UI and REST API |
 | `airflow-scheduler` | – | schedules task instances |
 | `airflow-dag-processor` | – | parses DAG files (a separate service in Airflow 3) |
+| `airflow-triggerer` | – | required for Airflow to report itself healthy |
 | `postgres` | – | Airflow metadata database |
 | `mlflow` | 5000 | tracking server, artifact store and Model Registry |
 | `api` | 8000 | FastAPI serving the champion model |
