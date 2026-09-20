@@ -38,6 +38,9 @@ without them this would be a cron job that overwrites production on every run.
 | `mlflow` | 5000 | tracking server, artifact store and Model Registry |
 | `api` | 8000 | FastAPI serving the champion model |
 
+Host ports come from `.env` (`AIRFLOW_PORT`, `MLFLOW_PORT`, `API_PORT`) so you can move them
+if something already owns a default.
+
 ## Quick start
 
 ```bash
@@ -140,9 +143,22 @@ tests/                      unit tests for drift, data, training and the API
 .github/workflows/ci.yml    lint + test, image builds, compose validation
 ```
 
+## Configuration that is easy to get wrong
+
+Three settings in `docker-compose.yml` are not optional, and each fails in a way that does
+not name itself. They are commented in place; repeated here because they cost real time:
+
+| Setting | Symptom when missing |
+|---|---|
+| `AIRFLOW__CORE__EXECUTION_API_SERVER_URL` | every task fails with `httpx.ConnectError: Connection refused` — Airflow 3 runs tasks through the Task SDK, which calls back into the API server, and the default points at `localhost` |
+| `AIRFLOW__API_AUTH__JWT_SECRET` | tasks fail with `ServerResponseError: Invalid auth token` — every Airflow service must sign with the same secret |
+| `mlflow server --allowed-hosts` | training fails with `403 Invalid Host header - possible DNS rebinding attack detected` — MLflow only accepts Host headers it knows, and the compose service name is not one by default |
+
 ## Notes
 
 * `AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_*` is Airflow 3's default auth manager. It is meant
   for development only — do not expose this compose file to a network you do not control.
 * The MLflow server uses SQLite and a local artifact volume. Fine for one machine; swap the
   backend store for Postgres and the artifact store for S3/MinIO before sharing it.
+* `--allowed-hosts` is scoped to the compose network plus localhost. Widen it only if you
+  move MLflow behind another hostname.

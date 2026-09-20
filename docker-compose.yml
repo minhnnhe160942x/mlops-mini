@@ -12,6 +12,14 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres:5432/${POSTGRES_DB:-airflow}
     AIRFLOW__API__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-mlops-mini-dev-secret}
+    # The Task SDK signs its calls to the execution API with this shared secret.
+    # Every Airflow service must agree on it or tasks die with "Invalid auth token".
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-mlops-mini-dev-jwt-secret}
+    # Airflow 3 runs tasks through the Task SDK, which calls back into the API
+    # server. The default points at localhost, which is nothing inside these
+    # containers - tasks fail with "Connection refused" without this.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
     # Airflow 3 ships SimpleAuthManager by default: users are "name:role" and the
     # password lives in a generated file, which init seeds so the login is stable.
     AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
@@ -54,8 +62,9 @@ services:
       --backend-store-uri sqlite:////mlflow/mlflow.db
       --serve-artifacts
       --artifacts-destination /mlflow/artifacts
+      --allowed-hosts mlflow:5000,localhost:5000,127.0.0.1:5000,localhost,127.0.0.1
     ports:
-      - "5000:5000"
+      - "${MLFLOW_PORT:-5000}:5000"
     volumes:
       - mlflow-data:/mlflow
     healthcheck:
@@ -81,7 +90,7 @@ services:
     <<: *airflow-common
     command: api-server
     ports:
-      - "8080:8080"
+      - "${AIRFLOW_PORT:-8080}:8080"
     depends_on:
       airflow-init:
         condition: service_completed_successfully
@@ -122,7 +131,7 @@ services:
       MLFLOW_HTTP_REQUEST_TIMEOUT: "10"
       MLFLOW_HTTP_REQUEST_MAX_RETRIES: "2"
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     depends_on:
       mlflow:
         condition: service_healthy
