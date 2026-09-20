@@ -13,11 +13,11 @@ flowchart LR
     RAW[("data/raw/wdbc.csv")] --> AF
     subgraph AF["Airflow 3.3.2 · LocalExecutor · :18080"]
         direction LR
-        I[ingest] --> V{validate<br/>fail if &gt;5% bad} --> S[split<br/>SHA-256 of sample_id]
-        S --> SC[scale<br/>z-score, train only] --> T[train_and_register] --> R[report]
+        I["ingest"] --> V{"validate<br/>fail if over 5% bad"} --> S["split<br/>SHA-256 of sample_id"]
+        S --> SC["scale<br/>z-score, train only"] --> T["train_and_register"] --> R["report"]
     end
-    T -->|log run, register version, move @champion| M[("MLflow 3.8.1<br/>Tracking + Registry<br/>:15010")]
-    API["FastAPI :18011<br/>/health · /predict"] -->|models:/…@champion<br/>or models:/…/N| M
+    T -->|"log run, register version, move the champion alias"| M[("MLflow 3.8.1<br/>Tracking + Registry<br/>:15010")]
+    API["FastAPI :18011<br/>/health · /predict"] -->|"models:/name@champion<br/>or models:/name/N"| M
     PG[("Postgres 16")] --- AF
 ```
 
