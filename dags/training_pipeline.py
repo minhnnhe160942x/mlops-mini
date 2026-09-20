@@ -5,14 +5,13 @@ the reference data skips retraining entirely, and a trained model is only
 promoted when it beats the incumbent champion.
 
 Trigger with a config to simulate drift:
-    {"shift": 1.5}
+    {"shift": 1.5, "batch_rows": 200}
 """
 
 from __future__ import annotations
 
 import sys
 from datetime import UTC, datetime
-from io import StringIO
 from pathlib import Path
 
 import pandas as pd
@@ -33,6 +32,11 @@ from mlops.train import PRIMARY_METRIC, train_and_log  # noqa: E402
 SETTINGS = load_settings()
 
 
+def materialise(spec: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Rebuild this run's (reference, batch) pair. See `mlops.data.materialise`."""
+    return data.materialise(spec, SETTINGS.random_state)
+
+
 @dag(
     dag_id="training_pipeline",
     schedule=None,
@@ -45,26 +49,17 @@ SETTINGS = load_settings()
 def training_pipeline():
     @task
     def ingest(**context) -> dict:
-        """Pull a fresh batch. `shift` fakes an upstream distribution change."""
+        """Describe the incoming batch. `shift` fakes an upstream distribution change."""
         params = context["params"]
-        frame = data.load_reference()
-        reference, pool = data.split_reference_and_pool(frame, SETTINGS.random_state)
-        batch = data.make_batch(
-            pool,
-            n_rows=int(params["batch_rows"]),
-            shift=float(params["shift"]),
-            random_state=SETTINGS.random_state,
-        )
-        return {
-            "reference": reference.to_json(orient="split"),
-            "batch": batch.to_json(orient="split"),
-        }
+        spec = {"shift": float(params["shift"]), "batch_rows": int(params["batch_rows"])}
+        _, batch = materialise(spec)
+        print(f"ingested {len(batch)} rows with shift={spec['shift']}")
+        return spec
 
     @task
-    def validate(payload: dict) -> dict:
+    def validate(spec: dict) -> dict:
         """Fail fast on an empty or malformed batch before spending time training."""
-        batch = pd.read_json(StringIO(payload["batch"]), orient="split")
-        reference = pd.read_json(StringIO(payload["reference"]), orient="split")
+        reference, batch = materialise(spec)
 
         if batch.empty:
             raise ValueError("incoming batch is empty")
@@ -73,30 +68,31 @@ def training_pipeline():
             raise ValueError(f"batch is missing columns: {sorted(missing)}")
         if batch[data.TARGET].isna().any():
             raise ValueError("batch contains rows without a label")
-        return payload
+        return spec
 
     @task
-    def check_drift(payload: dict) -> dict:
-        reference = pd.read_json(StringIO(payload["reference"]), orient="split")
-        batch = pd.read_json(StringIO(payload["batch"]), orient="split")
+    def check_drift(spec: dict) -> dict:
+        reference, batch = materialise(spec)
         scores = drift.dataset_psi(reference, batch, data.feature_columns(reference))
         verdict = drift.summarise(scores, SETTINGS.drift_psi_threshold)
-        print(f"PSI max={verdict['max_psi']:.4f} drifted={verdict['drifted']}")
-        return {**payload, "drift": verdict}
+        print(
+            f"PSI max={verdict['max_psi']:.4f} threshold={SETTINGS.drift_psi_threshold} "
+            f"drifted={verdict['drifted']}"
+        )
+        return {**spec, "drift": verdict}
 
     @task.branch
-    def drift_gate(payload: dict) -> str:
+    def drift_gate(spec: dict) -> str:
         """Retrain only when the batch actually looks different."""
-        return "train" if payload["drift"]["drifted"] else "skip_retrain"
+        return "train" if spec["drift"]["drifted"] else "skip_retrain"
 
     @task
     def skip_retrain() -> str:
         return "no drift detected - champion kept"
 
     @task
-    def train(payload: dict) -> dict:
-        reference = pd.read_json(StringIO(payload["reference"]), orient="split")
-        batch = pd.read_json(StringIO(payload["batch"]), orient="split")
+    def train(spec: dict) -> dict:
+        reference, batch = materialise(spec)
         combined = pd.concat([reference, batch], ignore_index=True)
 
         mlflow_run = train_and_log(
@@ -105,7 +101,7 @@ def training_pipeline():
             random_state=SETTINGS.random_state,
             extra_tags={
                 "trigger": "drift",
-                "max_psi": f"{payload['drift']['max_psi']:.4f}",
+                "max_psi": f"{spec['drift']['max_psi']:.4f}",
             },
         )
         print(f"run {mlflow_run['run_id']} metrics {mlflow_run['metrics']}")
@@ -121,10 +117,10 @@ def training_pipeline():
         candidate = mlflow_run["metrics"][PRIMARY_METRIC]
 
         if incumbent is None:
-            print(f"no champion yet - promoting first model ({candidate:.4f})")
+            print(f"no champion yet - promoting the first model ({candidate:.4f})")
             return "register_and_promote"
         if candidate >= incumbent:
-            print(f"candidate {candidate:.4f} >= champion {incumbent:.4f}")
+            print(f"candidate {candidate:.4f} >= champion {incumbent:.4f} - promoting")
             return "register_and_promote"
         print(f"candidate {candidate:.4f} < champion {incumbent:.4f} - rejected")
         return "reject"
@@ -146,11 +142,9 @@ def training_pipeline():
     def reject() -> str:
         return "candidate did not beat the champion - not promoted"
 
-    ingested = ingest()
-    validated = validate(ingested)
-    checked = check_drift(validated)
-
+    checked = check_drift(validate(ingest()))
     trained = train(checked)
+
     drift_gate(checked) >> [trained, skip_retrain()]
     evaluate(trained) >> [register_and_promote(trained), reject()]
 

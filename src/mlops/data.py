@@ -56,3 +56,20 @@ def make_batch(
 
 def feature_columns(frame: pd.DataFrame) -> list[str]:
     return [c for c in frame.columns if c != TARGET]
+
+
+def materialise(spec: dict, random_state: int = 42) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Rebuild the (reference, batch) pair described by a run spec.
+
+    Pushing frames between Airflow tasks through XCom would write hundreds of
+    kilobytes into the metadata database on every run. The dataset is bundled and
+    the draw is seeded, so each task rebuilds the identical pair from two numbers.
+    """
+    reference, pool = split_reference_and_pool(load_reference(), random_state)
+    batch = make_batch(
+        pool,
+        n_rows=int(spec["batch_rows"]),
+        shift=float(spec["shift"]),
+        random_state=random_state,
+    )
+    return reference, batch
