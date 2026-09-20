@@ -80,6 +80,13 @@ services:
     command:
       - -c
       - |
+        if [ ! -f /opt/airflow/dags/training_pipeline.py ]; then
+          echo "ERROR: /opt/airflow/dags is empty inside the container." >&2
+          echo "The ./dags bind mount did not resolve. This happens when the repo" >&2
+          echo "sits outside a path your Docker VM shares (common with Colima or" >&2
+          echo "Lima). Move the repo under your home directory and try again." >&2
+          exit 1
+        fi
         airflow db migrate
         printf '{"%s": "%s"}' "${AIRFLOW_ADMIN_USER:-admin}" "${AIRFLOW_ADMIN_PASSWORD:-admin}" \
           > /opt/airflow/logs/simple_auth_manager_passwords.json
