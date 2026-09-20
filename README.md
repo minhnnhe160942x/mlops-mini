@@ -88,11 +88,8 @@ Open the DAG's grid view in Airflow and the two runs sit side by side: where one
 `train -> evaluate -> register_and_promote`, the other took `skip_retrain` and skipped the
 rest.
 
-After a promotion, point the API at the new version:
-
-```bash
-curl -X POST http://localhost:8000/reload
-```
+After a promotion, the API picks the new version up on its own within about fifteen
+seconds. `POST /reload` forces it immediately if you do not want to wait.
 
 ### Changing the defaults
 

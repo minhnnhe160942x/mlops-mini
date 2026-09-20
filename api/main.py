@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,11 @@ SETTINGS = load_settings()
 
 STATE: dict[str, Any] = {"model": None, "version": None, "run_id": None, "metrics": {}}
 
+# How long to wait before retrying a registry that had nothing to serve. Without
+# a throttle every request to an empty registry would pay the client timeout.
+RETRY_INTERVAL_SECONDS = 15.0
+_last_attempt = 0.0
+
 
 def refresh_model() -> dict[str, Any]:
     """(Re)load the aliased model. Raises if the registry has nothing to serve."""
@@ -38,6 +44,31 @@ def refresh_model() -> dict[str, Any]:
     STATE.update(loaded)
     logger.info("loaded %s version %s", SETTINGS.model_uri, loaded["version"])
     return loaded
+
+
+def ensure_model() -> bool:
+    """Make sure a model is loaded, retrying a previously empty registry.
+
+    The API usually starts before the pipeline has ever run, so the startup load
+    finds nothing. Retrying here means the service starts serving on its own once
+    the first model is promoted - nobody has to call /reload.
+    """
+    global _last_attempt
+
+    if STATE["model"] is not None:
+        return True
+
+    now = time.monotonic()
+    if now - _last_attempt < RETRY_INTERVAL_SECONDS:
+        return False
+    _last_attempt = now
+
+    try:
+        refresh_model()
+    except Exception as exc:  # noqa: BLE001
+        logger.info("registry still has nothing to serve: %s", exc)
+        return False
+    return True
 
 
 @asynccontextmanager
@@ -83,14 +114,14 @@ def healthz() -> dict[str, str]:
 @app.get("/readyz", tags=["ops"])
 def readyz() -> dict[str, Any]:
     """Readiness: a model is loaded and /predict will answer."""
-    if STATE["model"] is None:
+    if not ensure_model():
         raise HTTPException(status_code=503, detail="no model loaded from the registry")
     return {"status": "ready", "model_version": STATE["version"]}
 
 
 @app.get("/model", tags=["model"])
 def model_info() -> dict[str, Any]:
-    if STATE["model"] is None:
+    if not ensure_model():
         raise HTTPException(status_code=503, detail="no model loaded from the registry")
     return {
         "name": SETTINGS.model_name,
@@ -114,7 +145,7 @@ def reload_model() -> dict[str, Any]:
 
 @app.post("/predict", response_model=PredictResponse, tags=["model"])
 def predict(request: PredictRequest) -> PredictResponse:
-    if STATE["model"] is None:
+    if not ensure_model():
         raise HTTPException(
             status_code=503,
             detail="no model loaded - run the training_pipeline DAG, then POST /reload",
