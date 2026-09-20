@@ -13,3 +13,7 @@ mlflow-data/
 
 # Planning artifacts stay local.
 .planning/
+
+# Backup written by scripts/corrupt_extract.py
+data/raw/wdbc.csv.orig
+data/staging/

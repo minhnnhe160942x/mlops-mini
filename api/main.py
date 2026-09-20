@@ -1,8 +1,8 @@
 """FastAPI serving layer.
 
-The service holds no model of its own: it resolves `models:/<name>@champion`
-from the MLflow Model Registry at startup, and `POST /reload` picks up whatever
-the pipeline promoted since. That keeps deployment and promotion independent.
+The service holds no model of its own: it resolves `SETTINGS.model_uri` from the
+MLflow Model Registry at startup, and `POST /reload` picks up whatever the
+pipeline promoted since. That keeps deployment and promotion independent.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import mlflow.sklearn
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -28,19 +29,43 @@ from mlops.config import load_settings  # noqa: E402
 logger = logging.getLogger("uvicorn.error")
 SETTINGS = load_settings()
 
-STATE: dict[str, Any] = {"model": None, "version": None, "run_id": None, "metrics": {}}
+STATE: dict[str, Any] = {
+    "model": None,
+    "version": None,
+    "run_id": None,
+    "metrics": {},
+    "error": None,
+}
 
 # How long to wait before retrying a registry that had nothing to serve. Without
 # a throttle every request to an empty registry would pay the client timeout.
 RETRY_INTERVAL_SECONDS = 15.0
 _last_attempt = 0.0
 
+# WDBC as the training set encodes it: class 1 is benign (diagnosis "B"), class 0
+# is malignant, so column 1 of predict_proba is the benign probability.
+BENIGN_CLASS_INDEX = 1
+N_FEATURES = 30
+
 
 def refresh_model() -> dict[str, Any]:
-    """(Re)load the aliased model. Raises if the registry has nothing to serve."""
-    loaded = registry.load_champion(
-        SETTINGS.tracking_uri, SETTINGS.model_name, SETTINGS.model_alias
+    """(Re)load the registered model. Raises if the registry has nothing to serve."""
+    client = registry.get_client(SETTINGS.tracking_uri)
+    version = (
+        client.get_model_version(SETTINGS.model_name, SETTINGS.model_version)
+        if SETTINGS.model_version
+        else client.get_model_version_by_alias(SETTINGS.model_name, SETTINGS.model_alias)
     )
+    # sklearn flavour rather than pyfunc: /predict reports a class probability and
+    # the pyfunc wrapper does not expose predict_proba.
+    model = mlflow.sklearn.load_model(SETTINGS.model_uri)
+    loaded = {
+        "model": model,
+        "version": version.version,
+        "run_id": version.run_id,
+        "metrics": client.get_run(version.run_id).data.metrics,
+        "error": None,
+    }
     STATE.update(loaded)
     logger.info("loaded %s version %s", SETTINGS.model_uri, loaded["version"])
     return loaded
@@ -66,6 +91,7 @@ def ensure_model() -> bool:
     try:
         refresh_model()
     except Exception as exc:  # noqa: BLE001
+        STATE["error"] = f"{type(exc).__name__}: {exc}"
         logger.info("registry still has nothing to serve: %s", exc)
         return False
     return True
@@ -74,10 +100,11 @@ def ensure_model() -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # A cold registry is normal before the first DAG run, so startup must not
-    # crash-loop the container - /readyz reports the gap instead.
+    # crash-loop the container - /health and /readyz report the gap instead.
     try:
         refresh_model()
     except Exception as exc:  # noqa: BLE001
+        STATE["error"] = f"{type(exc).__name__}: {exc}"
         logger.warning("no model to serve yet (%s): %s", SETTINGS.model_uri, exc)
     yield
 
@@ -92,17 +119,49 @@ Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_sch
 
 
 class PredictRequest(BaseModel):
-    rows: list[dict[str, float]] = Field(
+    """One WDBC row as a plain vector, in training column order."""
+
+    features: list[float] = Field(
         ...,
-        min_length=1,
-        description="One object per row, keyed by feature name.",
+        min_length=N_FEATURES,
+        max_length=N_FEATURES,
+        description="The 30 WDBC measurements, in the column order the model was trained on.",
     )
 
 
 class PredictResponse(BaseModel):
-    predictions: list[float]
-    model_version: str
-    model_name: str
+    prediction: str
+    probability_benign: float
+    served_by: str
+
+
+def _require_model() -> Any:
+    if not ensure_model():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"{SETTINGS.model_uri} not loaded - run the wdbc_pipeline DAG, "
+                f"then POST /reload ({STATE.get('error')})"
+            ),
+        )
+    return STATE["model"]
+
+
+@app.get("/health", tags=["ops"])
+def health() -> dict[str, Any]:
+    """Health with the model's state attached.
+
+    Answers 200 even when degraded: an empty registry is an expected phase, not a
+    dead process, and a 5xx here would take the container out of rotation for it.
+    """
+    if ensure_model():
+        return {"status": "ok", "model_loaded": True, "model_uri": SETTINGS.model_uri}
+    return {
+        "status": "degraded",
+        "model_loaded": False,
+        "model_uri": SETTINGS.model_uri,
+        "error": STATE.get("error") or "no model loaded from the registry",
+    }
 
 
 @app.get("/healthz", tags=["ops"])
@@ -139,28 +198,30 @@ def reload_model() -> dict[str, Any]:
     try:
         loaded = refresh_model()
     except Exception as exc:  # noqa: BLE001
+        STATE["error"] = f"{type(exc).__name__}: {exc}"
         raise HTTPException(status_code=503, detail=f"reload failed: {exc}") from exc
     return {"status": "reloaded", "model_version": loaded["version"]}
 
 
 @app.post("/predict", response_model=PredictResponse, tags=["model"])
 def predict(request: PredictRequest) -> PredictResponse:
-    if not ensure_model():
-        raise HTTPException(
-            status_code=503,
-            detail="no model loaded - run the training_pipeline DAG, then POST /reload",
-        )
+    """Score one row and answer with the diagnosis and its probability."""
+    model = _require_model()
 
-    frame = pd.DataFrame(request.rows)
+    # Training used named columns, so feed the vector back under those names -
+    # positional input would silently misalign the features.
+    columns = getattr(model, "feature_names_in_", None)
+    frame = pd.DataFrame([request.features], columns=columns)
+
     try:
-        predictions = STATE["model"].predict(frame)
+        proba = float(model.predict_proba(frame)[0][BENIGN_CLASS_INDEX])
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=422, detail=f"prediction failed: {exc}") from exc
 
     return PredictResponse(
-        predictions=[float(p) for p in predictions],
-        model_version=str(STATE["version"]),
-        model_name=SETTINGS.model_name,
+        prediction="benign" if proba >= 0.5 else "malignant",
+        probability_benign=round(proba, 4),
+        served_by=SETTINGS.model_uri,
     )
 
 

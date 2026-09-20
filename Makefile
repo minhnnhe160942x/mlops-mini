@@ -1,4 +1,4 @@
-.PHONY: up down logs test lint trigger predict reload
+.PHONY: up down logs ps test lint run corrupt repair predict health
 
 up:
 	docker compose up -d --build
@@ -9,19 +9,30 @@ down:
 logs:
 	docker compose logs -f --tail=100
 
+ps:
+	docker compose ps
+
 test:
 	python -m pytest -q
 
 lint:
 	python -m ruff check .
 
-# Trigger a run that simulates drifted input, so the gate retrains.
-trigger:
-	docker compose exec airflow-scheduler \
-	  airflow dags trigger training_pipeline --conf '{"shift": 1.5, "batch_rows": 200}'
+# Run the whole pipeline for one logical date, in the foreground.
+run:
+	docker compose exec airflow-scheduler airflow dags test wdbc_pipeline 2026-08-25
 
-reload:
-	curl -fsS -X POST http://localhost:8000/reload
+# Break 12% of the extract, then run again to watch validate refuse it.
+corrupt:
+	docker compose exec airflow-scheduler python /opt/airflow/scripts/corrupt_extract.py
+
+repair:
+	docker compose exec airflow-scheduler python /opt/airflow/scripts/corrupt_extract.py --repair
+
+health:
+	curl -s http://localhost:18011/health
 
 predict:
-	curl -fsS http://localhost:8000/model
+	docker compose exec airflow-scheduler python /opt/airflow/scripts/sample_request.py > sample_request.json
+	curl -s -X POST http://localhost:18011/predict \
+	  -H 'content-type: application/json' -d @sample_request.json

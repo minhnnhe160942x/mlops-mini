@@ -1,86 +1,116 @@
-"""Model training and evaluation, logged to MLflow."""
+"""Model training, evaluation and registration."""
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import mlflow
+import mlflow.sklearn
+import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from .data import TARGET, feature_columns
+from .extract import LABEL, feature_columns, run_dir
+from .scale import fit as scale_fit
 
-PRIMARY_METRIC = "roc_auc"
-
-
-def build_estimator(random_state: int = 42) -> Pipeline:
-    """Scaler + forest. Kept in one Pipeline so serving needs no preprocessing code."""
-    return Pipeline(
-        [
-            ("scaler", StandardScaler()),
-            (
-                "model",
-                RandomForestClassifier(
-                    n_estimators=200,
-                    max_depth=8,
-                    random_state=random_state,
-                    n_jobs=-1,
-                ),
-            ),
-        ]
-    )
+PRIMARY_METRIC = "test_roc_auc"
+BENIGN = "B"
 
 
-def evaluate(estimator: Pipeline, x_test: pd.DataFrame, y_test: pd.Series) -> dict[str, float]:
-    predictions = estimator.predict(x_test)
-    probabilities = estimator.predict_proba(x_test)[:, 1]
+def build_estimator(random_state: int = 42) -> RandomForestClassifier:
+    return RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1)
+
+
+def to_target(frame: pd.DataFrame) -> pd.Series:
+    """1 means benign. The positive class is stated once, here, so the metrics
+    and the label the API reports cannot drift apart."""
+    return (frame[LABEL] == BENIGN).astype(int)
+
+
+def evaluate(model: RandomForestClassifier, features: pd.DataFrame, target: pd.Series) -> dict:
+    probabilities = model.predict_proba(features)[:, 1]
+    predictions = (probabilities >= 0.5).astype(int)
     return {
-        "accuracy": float(accuracy_score(y_test, predictions)),
-        "f1": float(f1_score(y_test, predictions)),
-        PRIMARY_METRIC: float(roc_auc_score(y_test, probabilities)),
+        "test_accuracy": float(accuracy_score(target, predictions)),
+        "test_f1": float(f1_score(target, predictions)),
+        PRIMARY_METRIC: float(roc_auc_score(target, probabilities)),
     }
 
 
-def train_and_log(
-    frame: pd.DataFrame,
+def serving_pipeline(model: RandomForestClassifier, unscaled_train: pd.DataFrame) -> Pipeline:
+    """Bundle the training-time scaling into the model that gets registered.
+
+    The model is fitted on scaled data, so serving it raw measurements would feed
+    it numbers from a completely different range - the reason a benign row and a
+    malignant row can otherwise come back with the same probability. Attaching
+    the scaling lets the API post raw features without knowing a scaler exists.
+
+    The statistics are recomputed with the scale task's own function rather than
+    read back from scaler.json, which is rounded for readability; a served row
+    has to be transformed with the exact numbers training used.
+    """
+    mean, std = scale_fit(unscaled_train)
+
+    # Assembled from known statistics instead of re-fitted: pandas uses the
+    # sample standard deviation and StandardScaler the population one, and that
+    # small difference would shift every served row.
+    scaler = StandardScaler()
+    scaler.mean_ = mean.to_numpy(dtype=float)
+    scaler.scale_ = std.to_numpy(dtype=float)
+    scaler.var_ = scaler.scale_**2
+    scaler.n_features_in_ = len(mean)
+    scaler.feature_names_in_ = np.array(mean.index, dtype=object)
+    scaler.n_samples_seen_ = np.int64(0)
+
+    return Pipeline([("scaler", scaler), ("model", model)])
+
+
+def train_and_register(
+    staging_root: Path,
+    ds: str,
+    tracking_uri: str,
     experiment_name: str,
+    model_name: str,
     random_state: int = 42,
     extra_tags: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Train, log params/metrics/model to MLflow, return the run id and metrics."""
-    features = feature_columns(frame)
-    x_train, x_test, y_train, y_test = train_test_split(
-        frame[features],
-        frame[TARGET],
-        test_size=0.25,
-        random_state=random_state,
-        stratify=frame[TARGET],
-    )
+    """Train on the scaled training half, log the run, register a new version."""
+    directory = run_dir(staging_root, ds)
+    train = pd.read_parquet(directory / "train.parquet")
+    test = pd.read_parquet(directory / "test.parquet")
+    numeric = feature_columns(train)
 
+    mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(experiment_name)
+
     with mlflow.start_run() as run:
-        estimator = build_estimator(random_state)
-        estimator.fit(x_train, y_train)
-        metrics = evaluate(estimator, x_test, y_test)
+        model = build_estimator(random_state)
+        model.fit(train[numeric], to_target(train))
+        metrics = evaluate(model, test[numeric], to_target(test))
 
         mlflow.log_params(
             {
                 "n_estimators": 200,
-                "max_depth": 8,
                 "random_state": random_state,
-                "n_train_rows": len(x_train),
-                "n_features": len(features),
+                "logical_date": ds,
+                "n_train_rows": len(train),
+                "n_features": len(numeric),
             }
         )
         mlflow.log_metrics(metrics)
         mlflow.set_tags(extra_tags or {})
+        unscaled_train = pd.read_parquet(directory / "train_unscaled.parquet")
+        served = serving_pipeline(model, unscaled_train)
+        raw_example = unscaled_train[numeric].head(2)
         mlflow.sklearn.log_model(
-            sk_model=estimator,
+            sk_model=served,
             name="model",
-            input_example=x_train.head(2),
+            input_example=raw_example,
+            registered_model_name=model_name,
         )
-        return {"run_id": run.info.run_id, "metrics": metrics, "features": features}
+
+    return {"run_id": run.info.run_id, "model_name": model_name, "metrics": metrics}
