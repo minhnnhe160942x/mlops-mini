@@ -57,6 +57,8 @@ services:
       timeout: 5s
       retries: 10
 
+  # --allowed-hosts must list the port the UI is reached on as well as the
+  # in-network one, or opening MLflow from the host answers 403.
   mlflow:
     image: ghcr.io/mlflow/mlflow:v3.8.1
     command: >
@@ -66,7 +68,7 @@ services:
       --backend-store-uri sqlite:////mlflow/mlflow.db
       --serve-artifacts
       --artifacts-destination /mlflow/artifacts
-      --allowed-hosts mlflow:5000,localhost:5000,127.0.0.1:5000,localhost,127.0.0.1
+      --allowed-hosts mlflow:5000,localhost:5000,127.0.0.1:5000,localhost:${MLFLOW_PORT:-15010},127.0.0.1:${MLFLOW_PORT:-15010},localhost,127.0.0.1
     ports:
       - "${MLFLOW_PORT:-15010}:5000"
     volumes:

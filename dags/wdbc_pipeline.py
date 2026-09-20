@@ -13,14 +13,15 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-from airflow.exceptions import AirflowFailException
 
-# Airflow 3 exposes the decorators through the Task SDK; fall back to the 2.x
-# location so the DAG file stays importable for local linting and tests.
+# Airflow 3 exposes both the decorators and the exceptions through the Task SDK;
+# fall back to the 2.x locations so the DAG file stays importable for linting.
 try:
     from airflow.sdk import dag, task
+    from airflow.sdk.exceptions import AirflowFailException
 except ImportError:  # pragma: no cover - only hit on Airflow 2.x
     from airflow.decorators import dag, task
+    from airflow.exceptions import AirflowFailException
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
